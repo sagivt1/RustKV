@@ -49,8 +49,8 @@ impl KvStore {
         })?;
 
         if map.remove(&key).is_none() {
-            return Err(crate::KvsError::KeyNotFound);
             // Explicitly return an error if the key does not exist.
+            return Err(crate::KvsError::KeyNotFound);
         }
         
         Ok(())
