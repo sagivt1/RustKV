@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// A `Result` type alias for kvs operations.
 pub type Result<T> = std::result::Result<T, KvsError>;
 
 #[derive(Error, Debug)]
@@ -8,7 +9,7 @@ pub enum KvsError {
     Io(#[from] std::io::Error),
 
     #[error("Serialization error {0}")]
-    Serde(#[from] Box<bincode::ErrorKind>),
+    Serde(#[from] bincode::Error),
 
     #[error("Key not found")]
     KeyNotFound,
@@ -16,4 +17,3 @@ pub enum KvsError {
     #[error("Internal error {0}")]
     Internal(String),
 }
-
