@@ -7,24 +7,33 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 
+// Represents the commands that can be written to the log.
+// This allows us to rebuild the state of the KvStore by replaying the log.
 #[derive(Debug, Serialize, Deserialize)]
 enum Command {
     Set {key : String, value : String},
     Remove {key: String}
 }
 
-/// A thread-safe, in-memory key-value store that wraps a `HashMap`.
+/// A simple, persistent, thread-safe key-value store.
 ///
-/// It uses `Arc<RwLock<...>>` to allow for concurrent, thread-safe access.
-/// Cloning is a cheap operation as it only increments the atomic reference count.
+/// It stores key-value pairs in memory for fast lookups and appends every
+/// write operation to a log file on disk to ensure durability. The log is replayed
+/// on startup to restore the in-memory state.
+///
+/// Cloning is a cheap, lightweight operation as it only increments an atomic reference count.
 #[derive(Clone)]
 pub struct KvStore {
+    // The in-memory cache of key-value pairs for fast reads.
     map: Arc<RwLock<HashMap<String, String>>>,
+    // The writer for the on-disk write-ahead log (WAL).
+    // A Mutex is used to ensure that writes to the log are sequential.
     writer: Arc<Mutex<BufWriter<File>>>,
 }
 
 impl KvStore {
-    
+    /// Opens a `KvStore` and loads its data from the given path.
+    /// If the log file doesn't exist, it will be created.
     pub fn open(path: impl Into<PathBuf>) -> Result<KvStore> {
         let path = path.into();
 
@@ -34,13 +43,15 @@ impl KvStore {
             .create(true)
             .open(&path)?;
 
-        let writer = BufWriter::new(file.try_clone()?); // Clone file handle for writing
+        // Clone the file handle for a separate writer. This allows us to read and write
+        // to the same file concurrently (reading for startup, writing for operations).
+        let writer = BufWriter::new(file.try_clone()?);
 
         let map = Arc::new(RwLock::new(HashMap::new()));
         
-
         let reader = BufReader::new(File::open(&path)?);
-
+        
+        // Replay the write-ahead log to restore the in-memory state.
         Self::load(reader, &map)?;
 
         Ok(KvStore{
@@ -49,7 +60,9 @@ impl KvStore {
         })
     }
 
+    // Rebuilds the in-memory map by reading and applying all commands from the log file.
     fn load(mut reader: BufReader<File>, map: &Arc<RwLock<HashMap<String, String>>>) -> Result<()> {
+        // A write lock is held during the entire load process to prevent any other access.
         let mut map_guard = map.write().map_err(|_| KvsError::Internal("RwLock poisoned".into()))?;
 
         loop {
@@ -65,6 +78,8 @@ impl KvStore {
                 }
                 Err(e) => {
                     if let bincode::ErrorKind::Io(ref io_err) = *e {
+                        // `UnexpectedEof` is a normal condition, indicating the end of the log file.
+                        // Any other I/O error during deserialization is a corruption issue.
                         if io_err.kind() == io::ErrorKind::UnexpectedEof {
                             break;
                         }
@@ -76,12 +91,16 @@ impl KvStore {
         Ok(())
     }
 
-    /// Sets the value of a string key to a string.
+    /// Sets a key-value pair.
+    ///
+    /// This operation is persisted to the on-disk log before updating the in-memory map.
     pub fn set(&self, key: String, value: String) -> Result<()> {
-        // Acquire a write lock. This will block until no other read or write locks are held.
         let cmd = Command::Set {key: key.clone(), value: value.clone()};
         
         {
+            // Lock the writer, serialize the command, and flush to disk.
+            // This implements the write-ahead log (WAL) pattern for durability.
+            // The lock is released immediately after the write.
             let mut writer = self.writer.lock().map_err(|_| KvsError::Internal("Mutex poisoned".into()))?;
             bincode::serialize_into(&mut *writer, &cmd)?;
             writer.flush()?;
@@ -93,23 +112,30 @@ impl KvStore {
         Ok(())
     }
 
-    /// Gets the string value of a given string key.
-    /// Returns `None` if the key does not exist.
+    /// Gets the value associated with a key.
+    ///
+    /// Returns `None` if the key is not found. Reads are served from the in-memory
+    /// map for high performance.
     pub fn get(&self, key: String) -> Result<Option<String>> {
+        // Acquire a read lock, which allows for concurrent reads.
         let map = self.map.read().map_err(|_| KvsError::Internal("RwLock poisoned".into()))?;
         Ok(map.get(&key).cloned())
     }
 
-    /// Removes a given key.
+    /// Removes a key-value pair.
+    ///
+    /// Errors if the key does not exist. This operation is persisted to the log.
     pub fn remove(&self, key: String) -> Result<()> {
         let cmd = Command::Remove {key: key.clone()};
 
         {
+            // Similar to `set`, log the removal command first for durability.
             let mut writer = self.writer.lock().map_err(|_| KvsError::Internal("Mutex poisoned".into()))?;
             bincode::serialize_into(&mut *writer, &cmd)?;
             writer.flush()?;
         }
 
+        // Enforce that the key must exist for a remove operation to be valid.
         let mut map = self.map.write().map_err(|_| KvsError::Internal("RwLock poisoned".into()))?;
         if map.remove(&key).is_none() {
             return Err(KvsError::KeyNotFound);
